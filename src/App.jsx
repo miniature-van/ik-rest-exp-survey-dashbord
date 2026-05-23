@@ -361,7 +361,7 @@ export default function App() {
 
   function keyMetricWeekTrend(keyword) {
     const wMap = {};
-    for (const a of sorted) {
+    for (const a of filtered) {
       const r = getTaskResult(a.tasks || [], keyword);
       if (!r) continue;
       const wk = getWeekLabel(a.date);
@@ -389,7 +389,7 @@ export default function App() {
     { id: "categories",  label: "By Category" },
     { id: "gaps",        label: "Gap Analysis" },
     { id: "wins",        label: "Wins" },
-    { id: "trends",      label: "Trends" },
+    { id: "trends",      label: "Trends & Insights" },
     { id: "nycstrategy", label: "NYC Strategy Metrics" },
   ];
 
@@ -482,7 +482,7 @@ export default function App() {
           onChange={e => e.target.value && setDateFilter(e.target.value)}
           style={{ fontSize: 11, padding: "3px 8px", borderRadius: 20, border: `1px solid ${FISCAL_PERIODS.find(p => p.label === dateFilter) ? B.red : B.border}`, background: FISCAL_PERIODS.find(p => p.label === dateFilter) ? B.red : B.white, color: FISCAL_PERIODS.find(p => p.label === dateFilter) ? B.white : B.charcoal, cursor: "pointer", outline: "none" }}
         >
-          <option value="">Prior period…</option>
+          <option value="">By Period…</option>
           {FISCAL_PERIODS.filter(p => !currentPeriod || p.period < currentPeriod.period).map(p => (
             <option key={p.label} value={p.label}>{p.label} ({p.start} – {p.end})</option>
           ))}
@@ -775,40 +775,243 @@ export default function App() {
       })()}
 
       {/* ── TRENDS ── */}
-      {tab === "trends" && allAudits.length > 0 && (
-        <div>
-          <SL>Audit score — week over week by location</SL>
-          <Card>
-            <ResponsiveContainer width="100%" height={220}>
-              <LineChart data={weekTrend} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke={B.border} />
-                <XAxis dataKey="week" tick={{ fontSize: 10, fill: B.charcoal }} />
-                <YAxis domain={[50, 100]} tick={{ fontSize: 10, fill: B.charcoal }} />
-                <Tooltip contentStyle={{ fontSize: 11, borderRadius: 6 }} />
-                <Legend wrapperStyle={{ fontSize: 11 }} />
-                <Line type="monotone" dataKey="NoMad" stroke={B.red} strokeWidth={2} dot={{ r: 4, fill: B.red }} connectNulls />
-                <Line type="monotone" dataKey="Williamsburg" stroke={B.black} strokeWidth={2} dot={{ r: 4, fill: B.black }} connectNulls />
-              </LineChart>
-            </ResponsiveContainer>
-          </Card>
-          <SL>PTD vs YTD avg by location</SL>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-            {["NoMad","Williamsburg"].map(loc => {
-              const ptdA = periodAudits.filter(a => a.location === loc);
-              const ytdA = ytdAudits.filter(a => a.location === loc);
-              return (
-                <div key={loc} style={{ background: B.gray, borderRadius: 8, padding: "12px 14px" }}>
-                  <LocBadge loc={loc} />
-                  <div style={{ display: "flex", gap: 20, marginTop: 10 }}>
-                    <div><div style={{ fontSize: 10, color: B.charcoal }}>PTD avg</div><div style={{ fontSize: 22, fontWeight: 700, color: B.red }}>{avgScore(ptdA)}</div><div style={{ fontSize: 10, color: "#999" }}>{ptdA.length} audit{ptdA.length !== 1 ? "s" : ""}</div></div>
-                    <div><div style={{ fontSize: 10, color: B.charcoal }}>YTD avg</div><div style={{ fontSize: 22, fontWeight: 700, color: B.black }}>{avgScore(ytdA)}</div><div style={{ fontSize: 10, color: "#999" }}>{ytdA.length} audit{ytdA.length !== 1 ? "s" : ""}</div></div>
-                  </div>
+      {/* ── TRENDS & INSIGHTS ── */}
+      {tab === "trends" && allAudits.length > 0 && (() => {
+
+        // ── Insight engine ────────────────────────────────────────
+        const insights = { watch: [], strong: [], summary: [] };
+
+        // Helper: gap rate for a keyword across an audit set
+        const gapR = (audits, kw) => failRate(audits, kw);
+        const passR = (audits, kw) => { const r = gapR(audits, kw); return r !== null ? 100 - r : null; };
+
+        // Trend direction: compare first half vs second half of weekTrend per location
+        function trendDirection(loc) {
+          const pts = weekTrend.map(w => w[loc]).filter(v => v !== null);
+          if (pts.length < 3) return null;
+          const mid = Math.floor(pts.length / 2);
+          const first = pts.slice(0, mid).reduce((s,v)=>s+v,0)/mid;
+          const second = pts.slice(mid).reduce((s,v)=>s+v,0)/(pts.length-mid);
+          return +(second - first).toFixed(1);
+        }
+
+        // Consecutive weeks missing a standard
+        function consecutiveMisses(loc, keyword) {
+          const locWeeks = weekTrend.map(w => w.week);
+          const auditsByWeek = {};
+          for (const a of filtered.filter(x => x.location === loc)) {
+            const wk = getWeekLabel(a.date);
+            if (!auditsByWeek[wk]) auditsByWeek[wk] = [];
+            auditsByWeek[wk].push(a);
+          }
+          let streak = 0;
+          for (let i = locWeeks.length - 1; i >= 0; i--) {
+            const wkAudits = auditsByWeek[locWeeks[i]] || [];
+            if (!wkAudits.length) break;
+            const allMiss = wkAudits.every(a => {
+              const t = (a.tasks||[]).find(t => matchTask(t.name, keyword));
+              return t && t.status === "Fail";
+            });
+            if (allMiss) streak++;
+            else break;
+          }
+          return streak;
+        }
+
+        // Period summary score context
+        const nmScore = avgScore(nmAudits);
+        const wbScore = avgScore(wbAudits);
+        const nmTrendDelta = trendDirection("NoMad");
+        const wbTrendDelta = trendDirection("Williamsburg");
+        const filterLabel = dateFilter === "ytd" ? "year-to-date" : dateFilter === "period" ? `${currentPeriod?.label || "this period"}` : dateFilter === "quarter" ? "this quarter" : dateFilter === "week" ? "this week" : dateFilter;
+
+        // ── Watch insights ────────────────────────────────────────
+        for (const loc of ["NoMad", "Williamsburg"]) {
+          const locA = filtered.filter(a => a.location === loc);
+          if (!locA.length) continue;
+          const delta = trendDirection(loc);
+
+          // Declining trend
+          if (delta !== null && delta <= -5) {
+            insights.watch.push(`${loc} overall score has declined ${Math.abs(delta)} points across the ${filterLabel} window — a consistent downward trend, not a one-off.`);
+          }
+
+          // Consecutive standard misses
+          const standardChecks = [
+            { kw: "strong 'server' presence", label: "server presence on the floor" },
+            { kw: "First-Timer", label: "First-Timer Guest Journey" },
+            { kw: "greeted when leaving", label: "greeting guests on exit" },
+            { kw: "Above & beyond", label: "above & beyond customer service" },
+            { kw: "suggestive selling", label: "suggestive selling" },
+            { kw: "Retail fridge", label: "retail fridge stocking" },
+          ];
+          for (const { kw, label } of standardChecks) {
+            const streak = consecutiveMisses(loc, kw);
+            if (streak >= 2) {
+              insights.watch.push(`${loc} has missed the standard for ${label} ${streak} consecutive week${streak > 1 ? "s" : ""} in a row.`);
+            }
+          }
+
+          // High gap rate on key standards
+          const csGap = gapR(locA, "Above & beyond");
+          if (csGap !== null && csGap >= 75) {
+            insights.watch.push(`${loc} above & beyond customer service has a ${csGap}% gap rate ${filterLabel} — the most frequent miss in the dataset.`);
+          }
+
+          // Low overall score
+          const sc = avgScore(locA);
+          if (sc !== "—" && parseFloat(sc) < 72) {
+            insights.watch.push(`${loc} is averaging ${sc} ${filterLabel} — below the 75-point threshold that indicates consistent standard execution.`);
+          }
+        }
+
+        // Retail gap — both locations
+        const retailGapNm = gapR(nmAudits, "Retail fridge");
+        const retailGapWb = gapR(wbAudits, "Retail fridge");
+        if ((retailGapNm ?? 0) >= 50 && (retailGapWb ?? 0) >= 50) {
+          insights.watch.push(`Retail fridge stocking is a gap at both locations (${retailGapNm}% NoMad, ${retailGapWb}% WB) — indicates a systemic stocking or shift handoff issue, not location-specific.`);
+        }
+
+        // ── Strong insights ───────────────────────────────────────
+        for (const loc of ["NoMad", "Williamsburg"]) {
+          const locA = filtered.filter(a => a.location === loc);
+          if (!locA.length) continue;
+          const delta = trendDirection(loc);
+
+          // Improving trend
+          if (delta !== null && delta >= 5) {
+            insights.strong.push(`${loc} overall score has improved ${delta} points across the ${filterLabel} window — a positive trend worth sustaining.`);
+          }
+
+          // Strong category scores
+          for (const [k, label] of [["Exterior","exterior"], ["Washroom","washrooms"], ["Beverage","beverage execution"], ["Interior","interior presentation"]]) {
+            const sc = catAvg(locA, k);
+            if (sc !== null && sc >= 90) {
+              insights.strong.push(`${loc} is averaging ${sc} on ${label} ${filterLabel} — a consistent strength.`);
+            }
+          }
+
+          // Strong overall score
+          const sc = avgScore(locA);
+          if (sc !== "—" && parseFloat(sc) >= 82) {
+            insights.strong.push(`${loc} is averaging ${sc} overall ${filterLabel} — above the 80-point benchmark for strong operational execution.`);
+          }
+
+          // Standards being met
+          for (const { kw, label } of [
+            { kw: "Food chit times", label: "food chit times" },
+            { kw: "Beverage chit times", label: "beverage chit times" },
+            { kw: "Washrooms were clean", label: "washroom standards" },
+          ]) {
+            const pr = passR(locA, kw);
+            if (pr !== null && pr >= 85) {
+              insights.strong.push(`${loc} is meeting the standard for ${label} at a ${pr}% rate ${filterLabel}.`);
+            }
+          }
+        }
+
+        // ── Period summary (executive-facing) ─────────────────────
+        const hasWatch = insights.watch.length > 0;
+        const hasStrong = insights.strong.length > 0;
+        const nmStr = nmScore !== "—" ? `NoMad is averaging ${nmScore}` : null;
+        const wbStr = wbScore !== "—" ? `Williamsburg is averaging ${wbScore}` : null;
+        const scoreStr = [nmStr, wbStr].filter(Boolean).join(", ");
+
+        if (scoreStr) {
+          const trendStr = (() => {
+            const parts = [];
+            if (nmTrendDelta !== null) parts.push(`NoMad ${nmTrendDelta >= 0 ? "up" : "down"} ${Math.abs(nmTrendDelta)} pts`);
+            if (wbTrendDelta !== null) parts.push(`Williamsburg ${wbTrendDelta >= 0 ? "up" : "down"} ${Math.abs(wbTrendDelta)} pts`);
+            return parts.length ? ` Trend direction: ${parts.join(", ")}.` : "";
+          })();
+          insights.summary.push(`${scoreStr} for the ${filterLabel} window.${trendStr}`);
+        }
+        if (hasWatch) insights.summary.push(`${insights.watch.length} area${insights.watch.length > 1 ? "s" : ""} require${insights.watch.length === 1 ? "s" : ""} attention — see Watch section below.`);
+        if (hasStrong) insights.summary.push(`${insights.strong.length} area${insights.strong.length > 1 ? "s are" : " is"} performing at or above standard — see Strong section below.`);
+
+        return (
+          <div>
+            {/* Period summary */}
+            {insights.summary.length > 0 && (
+              <>
+                <SL>Period summary — {filterLabel}</SL>
+                <div style={{ background: B.black, borderRadius: 10, padding: "16px 20px", marginBottom: 16 }}>
+                  {insights.summary.map((s, i) => (
+                    <p key={i} style={{ fontSize: 13, color: i === 0 ? B.white : "#aaa", lineHeight: 1.7, marginBottom: i < insights.summary.length - 1 ? 6 : 0 }}>{s}</p>
+                  ))}
                 </div>
-              );
-            })}
+              </>
+            )}
+
+            {/* Watch */}
+            {insights.watch.length > 0 && (
+              <>
+                <SL>Watch — needs attention</SL>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 20 }}>
+                  {insights.watch.map((insight, i) => (
+                    <div key={i} style={{ display: "flex", gap: 12, padding: "11px 14px", borderRadius: 8, border: `0.5px solid ${B.border}`, borderLeft: `3px solid ${B.red}`, background: B.white }}>
+                      <div style={{ width: 18, height: 18, borderRadius: "50%", background: B.red, color: B.white, fontSize: 10, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>!</div>
+                      <p style={{ fontSize: 12, color: B.black, lineHeight: 1.6, margin: 0 }}>{insight}</p>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+
+            {/* Strong */}
+            {insights.strong.length > 0 && (
+              <>
+                <SL>Strong — performing at standard</SL>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 20 }}>
+                  {insights.strong.map((insight, i) => (
+                    <div key={i} style={{ display: "flex", gap: 12, padding: "11px 14px", borderRadius: 8, border: `0.5px solid ${B.border}`, borderLeft: `3px solid ${B.black}`, background: B.white }}>
+                      <div style={{ width: 18, height: 18, borderRadius: "50%", background: B.black, color: B.white, fontSize: 10, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>✓</div>
+                      <p style={{ fontSize: 12, color: B.black, lineHeight: 1.6, margin: 0 }}>{insight}</p>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+
+            {insights.watch.length === 0 && insights.strong.length === 0 && (
+              <p style={{ fontSize: 12, color: B.charcoal, marginBottom: 20 }}>Not enough data in this window to generate insights. Try a broader date filter.</p>
+            )}
+
+            {/* Trend charts */}
+            <SL>Audit score — week over week</SL>
+            <Card>
+              <ResponsiveContainer width="100%" height={220}>
+                <LineChart data={weekTrend} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={B.border} />
+                  <XAxis dataKey="week" tick={{ fontSize: 10, fill: B.charcoal }} />
+                  <YAxis domain={[50, 100]} tick={{ fontSize: 10, fill: B.charcoal }} />
+                  <Tooltip contentStyle={{ fontSize: 11, borderRadius: 6 }} />
+                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                  <Line type="monotone" dataKey="NoMad" stroke={B.red} strokeWidth={2} dot={{ r: 4, fill: B.red }} connectNulls />
+                  <Line type="monotone" dataKey="Williamsburg" stroke={B.black} strokeWidth={2} dot={{ r: 4, fill: B.black }} connectNulls />
+                </LineChart>
+              </ResponsiveContainer>
+            </Card>
+
+            <SL>PTD vs YTD avg by location</SL>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              {["NoMad","Williamsburg"].map(loc => {
+                const ptdA = periodAudits.filter(a => a.location === loc);
+                const ytdA = ytdAudits.filter(a => a.location === loc);
+                return (
+                  <div key={loc} style={{ background: B.gray, borderRadius: 8, padding: "12px 14px" }}>
+                    <LocBadge loc={loc} />
+                    <div style={{ display: "flex", gap: 20, marginTop: 10 }}>
+                      <div><div style={{ fontSize: 10, color: B.charcoal }}>PTD avg</div><div style={{ fontSize: 22, fontWeight: 700, color: B.red }}>{avgScore(ptdA)}</div><div style={{ fontSize: 10, color: "#999" }}>{ptdA.length} audit{ptdA.length !== 1 ? "s" : ""}</div></div>
+                      <div><div style={{ fontSize: 10, color: B.charcoal }}>YTD avg</div><div style={{ fontSize: 22, fontWeight: 700, color: B.black }}>{avgScore(ytdA)}</div><div style={{ fontSize: 10, color: "#999" }}>{ytdA.length} audit{ytdA.length !== 1 ? "s" : ""}</div></div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* ── NYC STRATEGY METRICS ── */}
       {tab === "nycstrategy" && allAudits.length > 0 && (
